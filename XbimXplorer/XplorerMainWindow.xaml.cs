@@ -18,20 +18,19 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Threading;
-using log4net;
-using log4net.Config;
-using log4net.Repository.Hierarchy;
+using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
 using Xbim.Common;
 using Xbim.Common.Metadata;
 using Xbim.Common.Step21;
 using Xbim.Ifc;
-using Xbim.IO.Esent;
+using Xbim.Ifc4.Interfaces;
 using Xbim.ModelGeometry.Scene;
 using Xbim.Presentation;
 using Xbim.Presentation.FederatedModel;
@@ -42,6 +41,11 @@ using XbimXplorer.Dialogs;
 using XbimXplorer.Dialogs.ExcludedTypes;
 using XbimXplorer.LogViewer;
 using XbimXplorer.Properties;
+using Serilog;
+using Serilog.Core;
+using Serilog.Events;
+using Xbim.IO;
+using Xbim.Geometry.Engine.Interop;
 
 #endregion
 
@@ -52,7 +56,7 @@ namespace XbimXplorer
     /// </summary>
     public partial class XplorerMainWindow : IXbimXplorerPluginMasterWindow, INotifyPropertyChanged
     {
-        private BackgroundWorker _worker;
+        private BackgroundWorker _loadFileBackgroundWorker;
         /// <summary>
         /// Used for the creation of a new federation file
         /// </summary>
@@ -69,6 +73,11 @@ namespace XbimXplorer
         private string _temporaryXbimFileName;
 
         private string _openedModelFileName;
+
+        protected Microsoft.Extensions.Logging.ILogger Logger { get; private set; }
+
+        public static ILoggerFactory LoggerFactory { get; private set; }
+
 
         /// <summary>
         /// Deals with the user-defined model file name.
@@ -92,9 +101,45 @@ namespace XbimXplorer
             }));
         }
 
+        public const string LogOutputTemplate =
+            "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj} ({ThreadId}){NewLine}{Exception}";
+
+        private LogEventLevel LoggingLevel { get => Settings.Default.LoggingLevel; }
+        private LoggingLevelSwitch loggingLevelSwitch = new LoggingLevelSwitch(LogEventLevel.Debug);
+
+
         public XplorerMainWindow(bool preventPluginLoad = false)
         {
+            // So we can use *.xbim files.
+            IfcStore.ModelProviderFactory.UseHeuristicModelProvider();
+            
+            LogSink = new InMemoryLogSink { Tag = "MainWindow" };
+            LogSink.Logged += LogEvent_Added;
+            LogSink.EventsLimit = 5000; // log event's minute
+
+            // Use the standard ME.LoggerFactory, but add Serilog as a provider. 
+            // This provides a richer configuration and allows us to create a custom Sink for the disply of 'in app' logs
+            LoggerFactory = new LoggerFactory();
+            
+            //loggingLevelSwitch.
+            LoggerFactory.AddSerilog();
+            Serilog.Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.ControlledBy(loggingLevelSwitch)
+                .WriteTo.File("XbimXplorer.txt", rollingInterval: RollingInterval.Day, rollOnFileSizeLimit: true, 
+                    outputTemplate: LogOutputTemplate)
+                .WriteTo.Sink(LogSink)
+                .Enrich.WithThreadId()
+                .Enrich.FromLogContext()
+                .CreateLogger();
+            // Set XBIM Essentials/Geometries's LoggerFactory - so Serilog drives everything.
+            XbimLogging.LoggerFactory = LoggerFactory;
+
+            Logger = LoggerFactory.CreateLogger<XplorerMainWindow>();
+
+            Logger.LogInformation("Xplorer started...");
+
             InitializeComponent();
+
             PreventPluginLoad = preventPluginLoad;
 
             // initialise the internal elements of the UI that behave like plugins
@@ -128,7 +173,9 @@ namespace XbimXplorer
         private void InitFromSettings()
         {
             FileAccessMode = Settings.Default.FileAccessMode;
-            OnPropertyChanged("DeveloperVisible");           
+            OnPropertyChanged("DeveloperVisible");
+            OnPropertyChanged(nameof(LoggingLevel));
+            loggingLevelSwitch.MinimumLevel = Settings.Default.LoggingLevel;
         }
 
         private ObservableMruList<string> _mruFiles = new ObservableMruList<string>();
@@ -169,9 +216,9 @@ namespace XbimXplorer
 
         void XplorerMainWindow_Closing(object sender, CancelEventArgs e)
         {
-            if (_worker != null && _worker.IsBusy)
+            if (_loadFileBackgroundWorker != null && _loadFileBackgroundWorker.IsBusy)
             {
-                Log.Warn("Closing cancelled because of active background task.");
+                Logger.LogWarning("Closing cancelled because of active background task.");
                 e.Cancel = true; //do nothing if a thread is alive
             }
             else
@@ -180,20 +227,11 @@ namespace XbimXplorer
 
         void XplorerMainWindow_Loaded(object sender, RoutedEventArgs e)
         {
-            // this enables a basic configuration for the logger.
-            //
-            BasicConfigurator.Configure();
-            var model = IfcStore.Create(null,IfcSchemaVersion.Ifc2X3, XbimStoreType.InMemoryModel);
+            var model = IfcStore.Create(null, XbimSchemaVersion.Ifc2X3, XbimStoreType.InMemoryModel);
             ModelProvider.ObjectInstance = model;
             ModelProvider.Refresh();
 
-            // logging information warnings
-            //
-            _appender = new EventAppender {Tag = "MainWindow"};
-            _appender.Logged += appender_Logged;
-
-            var hier = LogManager.GetRepository() as Hierarchy;
-            hier?.Root.AddAppender(_appender);
+            
 
             TestCRedist();
         }
@@ -202,8 +240,8 @@ namespace XbimXplorer
         {
             if (Xbim.ModelGeometry.XbimEnvironment.RedistInstalled())
                 return;
-            var msg = $"Requisite C++ environment missing, download and install from {Xbim.ModelGeometry.XbimEnvironment.RedistDownloadPath()}";
-            Log.Error(msg);
+            Logger.LogError("Requisite C++ environment missing, download and install from {VCPath}", 
+                Xbim.ModelGeometry.XbimEnvironment.RedistDownloadPath());
         }
 
         private void XplorerMainWindow_Closed(object sender, EventArgs e)
@@ -216,36 +254,44 @@ namespace XbimXplorer
         private void OpenAcceptableExtension(object s, DoWorkEventArgs args)
         {
             var worker = s as BackgroundWorker;
-            var ifcFilename = args.Argument as string;
+            var selectedFilename = args.Argument as string;
 
             try
             {
-                if (worker == null) throw new Exception("Background thread could not be accessed");
+                if (worker == null)
+                    throw new Exception("Background thread could not be accessed");
                 _temporaryXbimFileName = Path.GetTempFileName();
-                SetOpenedModelFileName(ifcFilename);
-                var model = IfcStore.Open(ifcFilename, null, null, worker.ReportProgress, FileAccessMode);
+                SetOpenedModelFileName(selectedFilename);
+                var model = IfcStore.Open(selectedFilename, null, null, worker.ReportProgress, FileAccessMode);
                 if (_meshModel)
                 {
+                    ApplyWorkarounds(model);
+                    // mesh direct model
                     if (model.GeometryStore.IsEmpty)
                     {
                         try
                         {
                             var context = new Xbim3DModelContext(model);
+                            
                             if (!_multiThreading)
                                 context.MaxThreads = 1;
+#if FastExtrusion
+                            context.UseSimplifiedFastExtruder = _simpleFastExtrusion;
+#endif
                             SetDeflection(model);
                             //upgrade to new geometry representation, uses the default 3D model
-                            context.CreateContext(progDelegate: worker.ReportProgress);
+                            context.CreateContext(worker.ReportProgress, true);
                         }
                         catch (Exception geomEx)
                         {
                             var sb = new StringBuilder();
-                            sb.AppendLine($"Error creating geometry context of '{ifcFilename}' {geomEx.StackTrace}.");
+                            sb.AppendLine($"Error creating geometry context of '{selectedFilename}' {geomEx.StackTrace}.");
                             var newexception = new Exception(sb.ToString(), geomEx);
-                            Log.Error(sb.ToString(), newexception);
+                            Logger.LogError(0, newexception, "Error creating geometry context of {filename}", selectedFilename);
                         }
                     }
 
+                    // mesh references
                     foreach (var modelReference in model.ReferencedModels)
                     {
                         // creates federation geometry contexts if needed
@@ -257,12 +303,15 @@ namespace XbimXplorer
                         var context = new Xbim3DModelContext(modelReference.Model);
                         if (!_multiThreading)
                             context.MaxThreads = 1;
+#if FastExtrusion
+                        context.UseSimplifiedFastExtruder = _simpleFastExtrusion;
+#endif
                         SetDeflection(modelReference.Model);                        
                         //upgrade to new geometry representation, uses the default 3D model
-                        context.CreateContext(worker.ReportProgress);
+                        context.CreateContext(worker.ReportProgress, true);
                     }
                     if (worker.CancellationPending)
-                        //if a cancellation has been requested then don't open the resulting file
+                    //if a cancellation has been requested then don't open the resulting file
                     {
                         try
                         {
@@ -274,25 +323,31 @@ namespace XbimXplorer
                         }
                         catch (Exception ex)
                         {
-                            Log.Error(ex.Message, ex);
+                            Logger.LogError(0, ex, "Failed to cancel open of model {filename}", selectedFilename);
                         }
                         return;
                     }
                 }
                 else
                 {
-                    Log.WarnFormat("Settings prevent mesh creation.");
+                    Logger.LogWarning("Settings prevent mesh creation.");
                 }
                 args.Result = model;
             }
             catch (Exception ex)
             {
                 var sb = new StringBuilder();
-                sb.AppendLine($"Error opening '{ifcFilename}' {ex.StackTrace}.");
+                sb.AppendLine($"Error opening '{selectedFilename}' {ex.StackTrace}.");
                 var newexception = new Exception(sb.ToString(), ex);
-                Log.Error(sb.ToString(), ex);
+                Logger.LogError(0, ex, "Error opening {filename}", selectedFilename);
                 args.Result = newexception;
             }
+        }
+
+        private void ApplyWorkarounds(IfcStore model)
+        {
+            model.AddWorkAroundSurfaceofLinearExtrusionForRevit();
+            model.AddWorkAroundTrimForPolylinesIncorrectlySetToOneForEntireCurve();
         }
 
         private void SetDeflection(IModel model)
@@ -339,10 +394,10 @@ namespace XbimXplorer
                 case ".zip": //it is a zip file containing xbim or ifc File
                 case ".xbimf":
                 case ".xbim":
-                    _worker.RunWorkerAsync(modelFileName);
+                    _loadFileBackgroundWorker.RunWorkerAsync(modelFileName);
                     break;              
                 default:
-                    Log.WarnFormat("Extension '{0}' has not been recognised.", ext);
+                    Logger.LogWarning("Extension '{extension}' has not been recognised.", ext);
                     break;
             }           
         }
@@ -368,14 +423,14 @@ namespace XbimXplorer
 
         private void SetWorkerForFileLoad()
         {
-            _worker = new BackgroundWorker
+            _loadFileBackgroundWorker = new BackgroundWorker
             {
                 WorkerReportsProgress = true,
                 WorkerSupportsCancellation = true
             };
-            _worker.ProgressChanged += OnProgressChanged;
-            _worker.DoWork += OpenAcceptableExtension;
-            _worker.RunWorkerCompleted += FileLoadCompleted;
+            _loadFileBackgroundWorker.ProgressChanged += OnProgressChanged;
+            _loadFileBackgroundWorker.DoWork += OpenAcceptableExtension;
+            _loadFileBackgroundWorker.RunWorkerCompleted += FileLoadCompleted;
         }
 
         private void FileLoadCompleted(object s, RunWorkerCompletedEventArgs args)
@@ -477,23 +532,32 @@ namespace XbimXplorer
         private void CommandBinding_SaveAs(object sender, ExecutedRoutedEventArgs e)
         {
             var dlg = new SaveFileDialog();
+            var ext = "";
             if (GetOpenedModelFileName() != null)
             {
                 var f = new FileInfo(GetOpenedModelFileName());
                 dlg.DefaultExt = f.Extension;
+                ext = f.Extension.ToLower();
                 dlg.InitialDirectory = f.DirectoryName;
                 dlg.FileName = f.Name;
             }
 
-            // filter starts with basic xbim formats
-            var corefilters = new[] {
-                    "Ifc File (*.ifc)|*.ifc",
-                    "xBIM File (*.xBIM)|*.xBIM", 
-                    "IfcXml File (*.IfcXml)|*.ifcxml", 
-                    "IfcZip File (*.IfcZip)|*.ifczip"
-                };
+            Dictionary<string, string> options = new Dictionary<string, string>();
+            options.Add(".ifc", "Ifc File (*.ifc)|*.ifc");
+            options.Add(".xbim", "xBIM File (*.xBIM)|*.xBIM");
+            options.Add(".ifcxml", "IfcXml File (*.IfcXml)|*.ifcxml");
+            options.Add(".ifczip", "IfcZip File (*.IfcZip)|*.ifczip");
 
-            dlg.Filter = string.Join("|", corefilters);
+            var filters = new List<string>();
+            if (options.ContainsKey(ext))
+            {
+                filters.Add(options[ext]);
+                options.Remove(ext);
+            }
+            filters.AddRange(options.Values);
+
+            // now set dialog
+            dlg.Filter = string.Join("|", filters.ToArray());
             dlg.Title = "Save As";
             dlg.AddExtension = true;
 
@@ -534,8 +598,8 @@ namespace XbimXplorer
         {
             try
             {
-                if (_worker != null && _worker.IsBusy)
-                    _worker.CancelAsync(); //tell it to stop
+                if (_loadFileBackgroundWorker != null && _loadFileBackgroundWorker.IsBusy)
+                    _loadFileBackgroundWorker.CancelAsync(); //tell it to stop
                 
                 SetOpenedModelFileName(null);
                 if (Model != null)
@@ -549,7 +613,7 @@ namespace XbimXplorer
             }
             finally
             {
-                if (!(_worker != null && _worker.IsBusy && _worker.CancellationPending)) //it is still busy but has been cancelled 
+                if (!(_loadFileBackgroundWorker != null && _loadFileBackgroundWorker.IsBusy && _loadFileBackgroundWorker.CancellationPending)) //it is still busy but has been cancelled 
                 {
                     if (!string.IsNullOrWhiteSpace(_temporaryXbimFileName) && File.Exists(_temporaryXbimFileName))
                         File.Delete(_temporaryXbimFileName);
@@ -570,7 +634,7 @@ namespace XbimXplorer
 
         private void CommandBinding_CanExecute(object sender, CanExecuteRoutedEventArgs e)
         {
-            if (_worker != null && _worker.IsBusy)
+            if (_loadFileBackgroundWorker != null && _loadFileBackgroundWorker.IsBusy)
                 e.CanExecute = false;
             else
             {
@@ -588,9 +652,9 @@ namespace XbimXplorer
         }
 
 
-        #endregion
+#endregion
 
-        # region "Federation Model operations"
+#region "Federation Model operations"
         private void EditFederationCmdExecuted(object sender, ExecutedRoutedEventArgs e)
         {
             var fdlg = new FederatedModelDialog {DataContext = Model};
@@ -653,7 +717,7 @@ namespace XbimXplorer
                 case ".ifczip":
                 case ".ifcxml":
                     // create temp file as a placeholder for the temporory xbim file                   
-                    fedModel = IfcStore.Create(null,IfcSchemaVersion.Ifc2X3, XbimStoreType.InMemoryModel);                    
+                    fedModel = IfcStore.Create(null, XbimSchemaVersion.Ifc2X3, XbimStoreType.InMemoryModel);
                     using (var txn = fedModel.BeginTransaction())
                     {
                         var project = fedModel.Instances.New<Xbim.Ifc2x3.Kernel.IfcProject>();
@@ -707,7 +771,7 @@ namespace XbimXplorer
             ModelProvider.Refresh();
         }
         
-        #endregion
+#endregion
 
         /// <summary>
         /// 
@@ -780,6 +844,11 @@ namespace XbimXplorer
         /// </summary>
         private bool _multiThreading = true;
 
+        /// <summary>
+        /// determines if the geometry engine will run on parallel threads.
+        /// </summary>
+        private bool _simpleFastExtrusion = false;
+
         private void SpatialControl_MouseDoubleClick(object sender, MouseButtonEventArgs e)
         {
             _camChanged = false;
@@ -824,6 +893,7 @@ namespace XbimXplorer
             // geom engine
             sett.ComputeGeometry.IsChecked = _meshModel;
             sett.MultiThreading.IsChecked = _multiThreading;
+            sett.SimpleFastExtrusion.IsChecked = _simpleFastExtrusion;
             if (!double.IsNaN(_angularDeflectionOverride))
                 sett.AngularDeflection.Text = _angularDeflectionOverride.ToString();
             if (!double.IsNaN(_deflectionOverride))
@@ -850,7 +920,9 @@ namespace XbimXplorer
                 _meshModel = sett.ComputeGeometry.IsChecked.Value;
             if (sett.MultiThreading.IsChecked != null)
                 _multiThreading = sett.MultiThreading.IsChecked.Value;
-            
+            if (sett.SimpleFastExtrusion.IsChecked != null)
+                _simpleFastExtrusion = sett.SimpleFastExtrusion.IsChecked.Value;
+
             _deflectionOverride = double.NaN;
             _angularDeflectionOverride = double.NaN;
             if (!string.IsNullOrWhiteSpace(sett.AngularDeflection.Text))
@@ -885,7 +957,7 @@ namespace XbimXplorer
 
         private void SetDefaultModeStyler(object sender, RoutedEventArgs e)
         {           
-            DrawingControl.DefaultLayerStyler = new SurfaceLayerStyler();
+            DrawingControl.DefaultLayerStyler = new SurfaceLayerStyler(this.Logger);
             ConnectStylerFeedBack();
             DrawingControl.ReloadModel();
         }
@@ -941,18 +1013,30 @@ namespace XbimXplorer
             if (Settings.Default.PluginStartupLoad && !PreventPluginLoad)
                 RefreshPlugins();
             ConnectStylerFeedBack();
-            _appender.EventsLimit = 100;
+
         }
         
         private void EntityLabel_KeyDown()
         {
-            var str = EntityLabel.Text.Trim(' ', '#');
-            int isLabel;
-            if (!int.TryParse(str, out isLabel)) 
-                return;
-            var entity = Model.Instances[isLabel];
+            var input = EntityLabel.Text;
+            var re = new Regex(@"#[ \t]*(\d+)");
+            var m = re.Match(input);
+            IPersistEntity entity = null;
+            if (m.Success)
+            {
+                int isLabel;
+                if (!int.TryParse(m.Groups[1].Value, out isLabel))
+                    return;
+                entity = Model.Instances[isLabel];
+            }
+            else
+            {
+                entity = Model.Instances.OfType<IIfcRoot>().FirstOrDefault(x => x.GlobalId == input);
+            }
+
             if (entity != null)
                 SelectedItem = entity;
+
         }
 
         private void ConfigureStyler(object sender, RoutedEventArgs e)
@@ -964,6 +1048,29 @@ namespace XbimXplorer
             if (!c.MustUpdate) 
                 return;
             DrawingControl.ExcludedTypes = c.ExcludedTypes;
+            DrawingControl.ReloadModel(DrawingControl3D.ModelRefreshOptions.ViewPreserveCameraPosition);
+        }
+
+        private void HideSelected(object sender, RoutedEventArgs e)
+        {
+            if (null != DrawingControl.HiddenInstances)
+                DrawingControl.HiddenInstances.AddRange(DrawingControl.Selection);
+            else
+                DrawingControl.HiddenInstances = DrawingControl.Selection.ToList();
+
+            DrawingControl.ReloadModel(DrawingControl3D.ModelRefreshOptions.ViewPreserveCameraPosition);
+        }
+
+        private void IsolateSelected(object sender, RoutedEventArgs e)
+        {
+            DrawingControl.IsolateInstances = DrawingControl.Selection.ToList();
+            DrawingControl.ReloadModel(DrawingControl3D.ModelRefreshOptions.ViewPreserveCameraPosition);
+        }
+
+        private void RestoreView(object sender, RoutedEventArgs e)
+        {
+            DrawingControl.IsolateInstances = null;
+            DrawingControl.HiddenInstances = null;
             DrawingControl.ReloadModel(DrawingControl3D.ModelRefreshOptions.ViewPreserveCameraPosition);
         }
 
@@ -1025,9 +1132,35 @@ namespace XbimXplorer
 
         private void SetStylerBoundCorners(object sender, RoutedEventArgs e)
         {
-            DrawingControl.DefaultLayerStyler = new BoundingBoxStyler();
+            DrawingControl.DefaultLayerStyler = new BoundingBoxStyler(this.Logger);
             ConnectStylerFeedBack();
             DrawingControl.ReloadModel();
+        }
+
+        private void CommandBoxLost(object sender, RoutedEventArgs e)
+        {
+            CommandBox.Visibility = Visibility.Collapsed;
+        }
+
+        private void CommandBoxEval(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter)
+            {
+                CommandBox.Visibility = Visibility.Collapsed;
+
+                var cmd = CommandPrompt.Text;
+                if (string.IsNullOrWhiteSpace(cmd))
+                    return;
+                Type t = typeof(Commands.wdwCommands);
+                var opened = OpenOrFocusPluginWindow(t) as Commands.wdwCommands;
+                opened.Execute(cmd);
+            }
+        }
+
+        private void ShowCommandBox(object sender, RoutedEventArgs e)
+        {
+            CommandBox.Visibility = Visibility.Visible;
+            CommandPrompt.Focus();
         }
     }
 }

@@ -1,11 +1,11 @@
-﻿using System;
+﻿using Microsoft.Extensions.Logging;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Windows;
 using System.Windows.Media.Media3D;
-using log4net;
 using Xbim.Common;
 using Xbim.Common.Federation;
 using Xbim.Common.Geometry;
@@ -16,14 +16,18 @@ namespace Xbim.Presentation.LayerStyling
 {
     public class SurfaceLayerStyler : ILayerStyler, IProgressiveLayerStyler
     {
-        protected static readonly ILog Log = LogManager.GetLogger("Xbim.Presentation.LayerStyling.SurfaceLayerStyler");
-
         public event ProgressChangedEventHandler ProgressChanged;
 
-        // ReSharper disable once CollectionNeverUpdated.Local
         readonly XbimColourMap _colourMap = new XbimColourMap();
 
         public bool UseMaps = false;
+
+        protected ILogger Logger { get; private set; }
+
+        public SurfaceLayerStyler(ILogger logger = null)
+        {
+            Logger = logger ?? XbimLogging.CreateLogger<SurfaceLayerStyler>();
+        }
 
         /// <summary>
         /// This version uses the new Geometry representation
@@ -32,12 +36,16 @@ namespace Xbim.Presentation.LayerStyling
         /// <param name="modelTransform">The transform to place the models geometry in the right place</param>
         /// <param name="opaqueShapes"></param>
         /// <param name="transparentShapes"></param>
-        /// <param name="exclude">List of type to exclude, by default excplict openings and spaces are excluded if exclude = null</param>
+        /// <param name="isolateInstances">List of instances to be isolated</param>
+        /// <param name="hideInstances">List of instances to be hidden</param>
+        /// <param name="excludeTypes">List of type to exclude, by default excplict openings and spaces are excluded if exclude = null</param>
         /// <returns></returns>
-        public XbimScene<WpfMeshGeometry3D, WpfMaterial> BuildScene(IModel model, XbimMatrix3D modelTransform, ModelVisual3D opaqueShapes, ModelVisual3D transparentShapes,
-            List<Type> exclude = null)
+        public XbimScene<WpfMeshGeometry3D, WpfMaterial> BuildScene(IModel model, XbimMatrix3D modelTransform, 
+            ModelVisual3D opaqueShapes, ModelVisual3D transparentShapes, List<IPersistEntity> isolateInstances = null, List<IPersistEntity> hideInstances = null, List<Type> excludeTypes = null)
         {
-            var excludedTypes = model.DefaultExclusions(exclude);
+            var excludedTypes = model.DefaultExclusions(excludeTypes);
+            var onlyInstances = isolateInstances?.Where(i => i.Model == model).ToDictionary(i => i.EntityLabel);
+            var hiddenInstances = hideInstances?.Where(i => i.Model == model).ToDictionary(i => i.EntityLabel);
 
             var scene = new XbimScene<WpfMeshGeometry3D, WpfMaterial>(model);
             var timer = new Stopwatch();
@@ -75,7 +83,9 @@ namespace Xbim.Presentation.LayerStyling
                     
                     // !typeof (IfcFeatureElement).IsAssignableFrom(IfcMetaData.GetType(s.IfcTypeId)) /*&&
                     // !typeof(IfcSpace).IsAssignableFrom(IfcMetaData.GetType(s.IfcTypeId))*/);
-                    foreach (var shapeInstance in shapeInstances)
+                    foreach (var shapeInstance in shapeInstances
+                        .Where(s => null == onlyInstances || onlyInstances.Count == 0 || onlyInstances.Keys.Contains(s.IfcProductLabel) )
+                        .Where(s => null == hiddenInstances || hiddenInstances.Count == 0 || !hiddenInstances.Keys.Contains(s.IfcProductLabel) ))
                     {
                         // logging 
                         var currentProgress = 100 * prog++ / tot;
@@ -193,7 +203,7 @@ namespace Xbim.Presentation.LayerStyling
                     }
                 }
             }
-            Log.DebugFormat("Time to load visual components: {0:F3} seconds", timer.Elapsed.TotalSeconds);
+            Logger.LogDebug("Time to load visual components: {0:F3} seconds", timer.Elapsed.TotalSeconds);
 
             ProgressChanged?.Invoke(this, new ProgressChangedEventArgs(0, "Ready"));
             return scene;
@@ -223,10 +233,19 @@ namespace Xbim.Presentation.LayerStyling
             return mg;
         }
 
-        protected static WpfMaterial GetWpfMaterial(IModel model, int styleId)
+        protected WpfMaterial GetWpfMaterial(IModel model, int styleId)
         {
             var sStyle = model.Instances[styleId] as IIfcSurfaceStyle;
             var texture = XbimTexture.Create(sStyle);
+            if(texture.ColourMap.Count > 0)
+            { 
+                if (texture.ColourMap[0].Alpha <= 0)
+                {
+                    texture.ColourMap[0].Alpha = 0.5f;
+                    Logger.LogWarning("Fully transparent style #{styleId} forced to 50% opacity.", styleId);
+                }
+            }
+
             texture.DefinedObjectId = styleId;
             var wpfMaterial = new WpfMaterial();
             wpfMaterial.CreateMaterial(texture);

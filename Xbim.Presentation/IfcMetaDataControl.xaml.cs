@@ -98,7 +98,6 @@ namespace Xbim.Presentation
             if (selectedTab == null)
                 return;
 
-            // ReSharper disable PossibleUnintendedReferenceComparison
             if (selectedTab == ObjectTab)
                 FillObjectData();
             else if (selectedTab == TypeTab)
@@ -109,7 +108,6 @@ namespace Xbim.Presentation
                 FillQuantityData();
             else if (selectedTab == MaterialTab)
                 FillMaterialData();
-            // ReSharper restore PossibleUnintendedReferenceComparison
         }
 
         private readonly ListCollectionView _propertyGroups;
@@ -491,7 +489,7 @@ namespace Xbim.Presentation
                 var repItemsLabels = ifcprod.Representation?.Representations?.SelectMany(rep => rep.Items).Select(i => i.EntityLabel).ToList();
 
                 // is there style information too?
-                var styles = ifcprod.Model.Instances.OfType<IIfcStyledItem>().Where(x => x.Item != null && repItemsLabels.Contains(x.Item.EntityLabel));
+                var styles = ifcprod.Model.Instances.OfType<IIfcStyledItem>().Where(x => repItemsLabels != null && (x.Item != null && repItemsLabels.Contains(x.Item.EntityLabel)));
                 foreach (var style in styles)
                 {
                     int i = 0;
@@ -511,20 +509,24 @@ namespace Xbim.Presentation
             if (matSel is IIfcMaterial) //simplest just add it
                 _materials.Add(new PropertyItem
                 {
-                    Name = $"{((IIfcMaterial) matSel).Name} [#{matSel.EntityLabel}]",
+                    Name = $"{((IIfcMaterial)matSel).Name} [#{matSel.EntityLabel}]",
                     PropertySetName = setName,
                     Value = ""
                 });
             else if (matSel is IIfcMaterialLayer)
+            {
+                var asMatLayer = matSel as IIfcMaterialLayer;
+
                 _materials.Add(new PropertyItem
                 {
-                    Name = $"{((IIfcMaterialLayer) matSel).Material.Name} [#{matSel.EntityLabel}]",
-                    Value = ((IIfcMaterialLayer) matSel).LayerThickness.Value.ToString(),
+                    Name = $"{asMatLayer.Material?.Name} [#{matSel.EntityLabel}]",
+                    Value = asMatLayer.LayerThickness.Value?.ToString(),
                     PropertySetName = setName
                 });
+            }
             else if (matSel is IIfcMaterialList)
             {
-                foreach (var mat in ((IIfcMaterialList) matSel).Materials)
+                foreach (var mat in ((IIfcMaterialList)matSel).Materials)
                 {
                     _materials.Add(new PropertyItem
                     {
@@ -536,17 +538,17 @@ namespace Xbim.Presentation
             }
             else if (matSel is IIfcMaterialLayerSet)
             {
-                foreach (var item in ((IIfcMaterialLayerSet) matSel).MaterialLayers) //recursive call to add materials
+                foreach (var item in ((IIfcMaterialLayerSet)matSel).MaterialLayers) //recursive call to add materials
                 {
-                    AddMaterialData(item, ((IIfcMaterialLayerSet) matSel).LayerSetName);
+                    AddMaterialData(item, ((IIfcMaterialLayerSet)matSel).LayerSetName);
                 }
             }
             else if (matSel is IIfcMaterialLayerSetUsage)
             {
                 //recursive call to add materials
-                foreach (var item in ((IIfcMaterialLayerSetUsage) matSel).ForLayerSet.MaterialLayers)
+                foreach (var item in ((IIfcMaterialLayerSetUsage)matSel).ForLayerSet.MaterialLayers)
                 {
-                    AddMaterialData(item, ((IIfcMaterialLayerSetUsage) matSel).ForLayerSet.LayerSetName);
+                    AddMaterialData(item, ((IIfcMaterialLayerSetUsage)matSel).ForLayerSet.LayerSetName);
                 }
             }
         }

@@ -4,7 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
-using log4net;
+using Microsoft.Extensions.Logging;
 using NuGet;
 using Xbim.Presentation;
 
@@ -15,81 +15,51 @@ namespace XbimXplorer.PluginSystem
     /// </summary>
     public partial class PluginsConfig
     {
-        private static readonly ILog Log = LogManager.GetLogger("XbimXplorer.PluginSystem.PluginsConfig");
+
+        protected Microsoft.Extensions.Logging.ILogger Logger { get; private set; }
 
         private XplorerMainWindow _mainWindow;
 
         public PluginsConfig()
         {
             InitializeComponent();
+            Logger = XplorerMainWindow.LoggerFactory.CreateLogger<PluginsConfig>();
             RefreshPluginList();
             _mainWindow = Application.Current.MainWindow as XplorerMainWindow;
             DataContext = this;
             SelectedPlugin = new PluginInformationVm(null);
         }
 
-        internal string SelectedRepoUrl => "https://www.myget.org/F/xbim-plugins/api/v2";
-
         private void ShowRepository()
         {
-            RefreshLocalPlugins();
-
             var plugins = new List<PluginInformationVm>();
-            var repo = PackageRepositoryFactory.Default.CreateRepository(SelectedRepoUrl);
-
             try
             {
-                var option = DisplayOptionText;
-                var allowDevelop = option != "Stable";
-                
-                var fnd = repo.Search("XplorerPlugin", allowDevelop);
-                foreach (var package in fnd)
+                var option = (PluginChannelOption)Enum.Parse(typeof(PluginChannelOption), DisplayOptionText);
+                foreach (var plugin in _xplorerPlugins.GetPlugins(option, NugetVersion))
                 {
-                    if (option != "All versions")
-                    {
-                        if (allowDevelop && !package.IsAbsoluteLatestVersion)
-                            continue;
-                        if (!allowDevelop && !package.IsLatestVersion)
-                            continue;
-                    }
-                    var pv = new PluginInformation(package);
-                    if (_diskPlugins.ContainsKey(package.Id))
-                    {
-                        pv.SetDirectoryInfo(_diskPlugins[package.Id]);
-                    }
-                    plugins.Add(new PluginInformationVm(pv));
+                    plugins.Add(new PluginInformationVm(plugin));
                 }
             }
             catch (Exception ex)
             {
-                Log.Error("An error occurred getting repository information.", ex);
+                Logger.LogError(0, ex, "An error occurred getting repository information.");
             }
-
             PluginList.ItemsSource = plugins;
         }
 
-        private readonly Dictionary<string, PluginInformation> _diskPlugins =
-            new Dictionary<string, PluginInformation>();
+        private PluginManagement _xplorerPlugins = new PluginManagement();
 
         private PluginInformationVm _selectedPlugin;
-
-        private void RefreshLocalPlugins()
-        {
-            _diskPlugins.Clear();
-            var dirs = PluginManagement.GetPluginDirectories();
-            foreach (var directoryInfo in dirs)
-            {
-                var pc = new PluginInformation(directoryInfo);
-                _diskPlugins.Add(pc.PluginId, pc);
-            }
-        }
-
+        
         private string DisplayOptionText
         {
             get
             {
                 var ci = DisplayOption.SelectedItem as ComboBoxItem;
-                return ci.Content as string;
+                var NoSpace = ci.Content as string;
+                NoSpace = NoSpace.Replace(" ", "");
+                return NoSpace ;
             }
         }
         
@@ -103,14 +73,14 @@ namespace XbimXplorer.PluginSystem
                 {
                     ShowRepository();
                 }
+                SelectedPlugin = new PluginInformationVm(null);
             }
         }
 
         private void ShowDiskPlugins()
         {
-            RefreshLocalPlugins();
-            var plugins =
-                _diskPlugins.Values.Where(x => x != null)
+            _xplorerPlugins.RefreshLocalPlugins();
+            var plugins = _xplorerPlugins.DiskPlugins.Where(x => x != null)
                     .Select(pluginConfig => new PluginInformationVm(pluginConfig))
                     .ToList();
             PluginList.ItemsSource = plugins;
@@ -149,7 +119,7 @@ namespace XbimXplorer.PluginSystem
                 }
                 catch (Exception ex)
                 {
-                    Log.Error($"Error processing package file [{fname}].", ex);
+                    Logger.LogError(0, ex, "Error processing package file {filename}.", fname);
                 }
             }
             RefreshPluginList();

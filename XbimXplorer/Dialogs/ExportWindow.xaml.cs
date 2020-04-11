@@ -1,6 +1,7 @@
 ﻿using System;
 using System.IO;
 using System.Windows;
+using Xbim.Ifc;
 
 namespace XbimXplorer.Dialogs
 {
@@ -76,7 +77,6 @@ namespace XbimXplorer.Dialogs
                 }
 
                 // this makes sense to keep if there will be more export formats again in the future
-                // ReSharper disable once RedundantAssignment
                 totExports--;
             }
             Close();
